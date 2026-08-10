@@ -45,6 +45,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -1278,37 +1279,107 @@ func defaultVMInstanceType(ctx context.Context, client ctrlruntimeclient.Client,
 		return nil, nil
 	}
 
-	// Try v1beta1 namespace-scoped VirtualMachineInstancetype first (preferred stable API)
-	if err := client.Get(ctx, types.NamespacedName{Name: instanceTypeMatcher.Name, Namespace: namespace}, &kubevirtinstancetypev1beta1.VirtualMachineInstancetype{}); err == nil {
-		return &kubevirtcorev1.InstancetypeMatcher{
-			Name: instanceTypeMatcher.Name,
-			Kind: "VirtualMachineInstancetype",
-		}, nil
+	const (
+		virtualMachineInstancetypeKind        = "VirtualMachineInstancetype"
+		virtualMachineClusterInstancetypeKind = "VirtualMachineClusterInstancetype"
+	)
+
+	matcher := instanceTypeMatcher.DeepCopy()
+
+	switch {
+	case strings.EqualFold(matcher.Kind, virtualMachineInstancetypeKind):
+		if namespace == "" {
+			return nil, fmt.Errorf("cannot resolve namespaced %s %q without an infrastructure namespace", virtualMachineInstancetypeKind, matcher.Name)
+		}
+
+		found, err := namespacedVMInstancetypeExists(ctx, client, matcher.Name, namespace)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve %s %q in namespace %q: %w", virtualMachineInstancetypeKind, matcher.Name, namespace, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("%s %q not found in namespace %q", virtualMachineInstancetypeKind, matcher.Name, namespace)
+		}
+
+		matcher.Kind = virtualMachineInstancetypeKind
+		return matcher, nil
+
+	case strings.EqualFold(matcher.Kind, virtualMachineClusterInstancetypeKind):
+		found, err := clusterVMInstancetypeExists(ctx, client, matcher.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve %s %q: %w", virtualMachineClusterInstancetypeKind, matcher.Name, err)
+		}
+		if !found {
+			return nil, fmt.Errorf("%s %q not found", virtualMachineClusterInstancetypeKind, matcher.Name)
+		}
+
+		matcher.Kind = virtualMachineClusterInstancetypeKind
+		return matcher, nil
+
+	case matcher.Kind != "":
+		return nil, fmt.Errorf("unsupported KubeVirt instancetype kind %q: expected %q or %q", matcher.Kind, virtualMachineInstancetypeKind, virtualMachineClusterInstancetypeKind)
 	}
 
-	// Try v1beta1 cluster-scoped VirtualMachineClusterInstancetype
-	if err := client.Get(ctx, types.NamespacedName{Name: instanceTypeMatcher.Name}, &kubevirtinstancetypev1beta1.VirtualMachineClusterInstancetype{}); err == nil {
-		return &kubevirtcorev1.InstancetypeMatcher{
-			Name: instanceTypeMatcher.Name,
-			Kind: "VirtualMachineClusterInstancetype",
-		}, nil
+	// Legacy provider specs did not record the instancetype kind. Resolve those
+	// matchers in namespace scope across supported API versions before falling
+	// back to cluster scope. Explicit kinds above are authoritative and must
+	// never fall back to an object in another scope.
+	if namespace != "" {
+		found, err := namespacedVMInstancetypeExists(ctx, client, matcher.Name, namespace)
+		if err != nil {
+			return nil, fmt.Errorf("failed to discover %s %q in namespace %q: %w", virtualMachineInstancetypeKind, matcher.Name, namespace, err)
+		}
+		if found {
+			matcher.Kind = virtualMachineInstancetypeKind
+			return matcher, nil
+		}
 	}
 
-	// Fall back to v1alpha1 namespace-scoped VirtualMachineInstancetype
-	if err := client.Get(ctx, types.NamespacedName{Name: instanceTypeMatcher.Name, Namespace: namespace}, &kubevirtinstancetypev1alpha1.VirtualMachineInstancetype{}); err == nil {
-		return &kubevirtcorev1.InstancetypeMatcher{
-			Name: instanceTypeMatcher.Name,
-			Kind: "VirtualMachineInstancetype",
-		}, nil
+	found, err := clusterVMInstancetypeExists(ctx, client, matcher.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover %s %q: %w", virtualMachineClusterInstancetypeKind, matcher.Name, err)
+	}
+	if found {
+		matcher.Kind = virtualMachineClusterInstancetypeKind
+		return matcher, nil
 	}
 
-	// Fall back to v1alpha1 cluster-scoped VirtualMachineClusterInstancetype
-	if err := client.Get(ctx, types.NamespacedName{Name: instanceTypeMatcher.Name}, &kubevirtinstancetypev1alpha1.VirtualMachineClusterInstancetype{}); err == nil {
-		return &kubevirtcorev1.InstancetypeMatcher{
-			Name: instanceTypeMatcher.Name,
-			Kind: "VirtualMachineClusterInstancetype",
-		}, nil
+	return nil, fmt.Errorf("no VirtualMachineInstancetype or VirtualMachineClusterInstancetype found with name %q", matcher.Name)
+}
+
+func namespacedVMInstancetypeExists(ctx context.Context, client ctrlruntimeclient.Client, name, namespace string) (bool, error) {
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if err := client.Get(ctx, key, &kubevirtinstancetypev1beta1.VirtualMachineInstancetype{}); err == nil {
+		return true, nil
+	} else if !isInstancetypeLookupMiss(err) {
+		return false, err
 	}
 
-	return nil, fmt.Errorf("no VirtualMachineInstancetype or VirtualMachineClusterInstancetype found with name %q", instanceTypeMatcher.Name)
+	if err := client.Get(ctx, key, &kubevirtinstancetypev1alpha1.VirtualMachineInstancetype{}); err == nil {
+		return true, nil
+	} else if !isInstancetypeLookupMiss(err) {
+		return false, err
+	}
+
+	return false, nil
+}
+
+func clusterVMInstancetypeExists(ctx context.Context, client ctrlruntimeclient.Client, name string) (bool, error) {
+	key := types.NamespacedName{Name: name}
+	if err := client.Get(ctx, key, &kubevirtinstancetypev1beta1.VirtualMachineClusterInstancetype{}); err == nil {
+		return true, nil
+	} else if !isInstancetypeLookupMiss(err) {
+		return false, err
+	}
+
+	if err := client.Get(ctx, key, &kubevirtinstancetypev1alpha1.VirtualMachineClusterInstancetype{}); err == nil {
+		return true, nil
+	} else if !isInstancetypeLookupMiss(err) {
+		return false, err
+	}
+
+	return false, nil
+}
+
+func isInstancetypeLookupMiss(err error) bool {
+	return apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err)
 }
